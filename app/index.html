@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0b1020" />
+  <meta name="description" content="Sightline — custom computer vision for object detection and tracking." />
+  <title>Sightline — Object Intelligence</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .camera-panel { position: relative; overflow: hidden; }
+    #cameraVideo { display: block; width: 100%; height: 100%; }
+    #detectionCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 3; }
+    .detection-results { margin-top: 12px; padding: 12px 14px; border-radius: 10px; border: 1px solid rgba(34,199,184,.35); background: rgba(11,16,32,.9); color: #e8f7ff; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+    .detection-results[hidden] { display: none; }
+    .detection-results strong { color: #22c7b8; }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Sightline home">
+        <span class="brand-mark">S</span>
+        <span><strong>SIGHTLINE</strong><small>OBJECT INTELLIGENCE</small></span>
+      </a>
+      <span class="status"><span class="status-dot"></span> LOCAL AI MODE</span>
+    </header>
+
+    <section class="intro">
+      <p class="eyebrow">COMPUTER VISION · YOLO11N</p>
+      <h1>See the world<br /><span>differently.</span></h1>
+      <p class="intro-copy">Detect everyday objects and follow their movement. Your camera-powered vision workspace starts here.</p>
+    </section>
+
+    <section class="workspace">
+      <div class="section-heading">
+        <div><p class="eyebrow">LIVE WORKSPACE</p><h2>Detection studio</h2></div>
+        <span class="preview-tag">LOCAL INFERENCE</span>
+      </div>
+
+      <div class="camera-panel" id="cameraPanel">
+        <video id="cameraVideo" autoplay playsinline muted aria-label="Live webcam preview"></video>
+        <canvas id="detectionCanvas" aria-hidden="true"></canvas>
+        <div class="camera-grid"></div>
+        <div class="camera-placeholder" id="cameraPlaceholder">
+          <div class="camera-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="6" width="13" height="12" rx="2"></rect><path d="m16 10 5-3v10l-5-3"></path></svg>
+          </div>
+          <h3>Your vision workspace</h3>
+          <p id="cameraMessage">Start your camera to begin your Sightline session.</p>
+          <span class="waiting-label" id="cameraStatus">CAMERA OFF</span>
+        </div>
+        <span class="corner corner-tl"></span><span class="corner corner-tr"></span>
+        <span class="corner corner-bl"></span><span class="corner corner-br"></span>
+      </div>
+
+      <div class="camera-controls">
+        <button id="startCamera" class="camera-button primary" type="button"><span aria-hidden="true">▶</span> Start camera</button>
+        <button id="stopCamera" class="camera-button secondary" type="button" disabled>Stop camera</button>
+        <button id="resetStats" class="camera-button secondary" type="button">Reset stats</button>
+        <span class="privacy-note"><span class="status-dot"></span> Frames sent only to this computer's local API</span>
+      </div>
+
+      <div id="detectionResults" class="detection-results" aria-live="polite" hidden>Waiting for the first prediction…</div>
+
+      <div class="metrics">
+        <article class="metric"><span class="metric-label">DETECTIONS</span><strong id="detectionMetric">—</strong><span class="metric-note">Objects in latest frame</span></article>
+        <article class="metric"><span class="metric-label">UNIQUE TRACK IDS</span><strong id="trackedMetric">0</strong><span class="metric-note" id="trackedNote">Seen this session</span></article>
+        <article class="metric"><span class="metric-label">PROCESSING</span><strong id="processingMetric" class="metric-state">OFFLINE</strong><span id="processingNote" class="metric-note">Backend not connected</span></article>
+      </div>
+    </section>
+
+    <section class="capabilities">
+      <p class="eyebrow">BUILT FOR REAL-WORLD OBJECTS</p><h2>One camera. Multiple possibilities.</h2>
+      <div class="object-list">
+        <span>Person</span><span>Phone</span><span>Bottle</span><span>Book</span><span>Backpack</span><span>Handbag</span><span>Car</span><span>Motorcycle</span><span>Cup</span><span>Shoe</span><span>Sunglasses</span>
+      </div>
+    </section>
+
+    <footer><span>SIGHTLINE <span class="footer-separator">/</span> COMPUTER VISION PROJECT</span><span>Built with curiosity. Powered by vision.</span></footer>
+  </main>
+
+  <script>
+    "use strict";
+    const API_URL = "http://127.0.0.1:8000/predict";
+    const video = document.getElementById("cameraVideo");
+    const startButton = document.getElementById("startCamera");
+    const stopButton = document.getElementById("stopCamera");
+    const resetStatsButton = document.getElementById("resetStats");
+    const placeholder = document.getElementById("cameraPlaceholder");
+    const message = document.getElementById("cameraMessage");
+    const status = document.getElementById("cameraStatus");
+    const cameraPanel = document.getElementById("cameraPanel");
+    const detectionCanvas = document.getElementById("detectionCanvas");
+    const detectionContext = detectionCanvas.getContext("2d");
+    const detectionResults = document.getElementById("detectionResults");
+    const detectionMetric = document.getElementById("detectionMetric");
+    const trackedMetric = document.getElementById("trackedMetric");
+    const trackedNote = document.getElementById("trackedNote");
+    const processingMetric = document.getElementById("processingMetric");
+    const processingNote = document.getElementById("processingNote");
+
+    let cameraStream = null;
+    let frameTimer = null;
+    let predictionBusy = false;
+    let latestDetections = null;
+    // IDs observed during this browser session; these are tracker IDs, not guaranteed physical-object identities.
+    const sessionTrackIds = new Set();
+    let sessionDetectionTotal = 0;
+    const frameCanvas = document.createElement("canvas");
+    const frameContext = frameCanvas.getContext("2d");
+
+    function resizeDetectionCanvas() {
+      const rect = cameraPanel.getBoundingClientRect();
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      detectionCanvas.width = Math.round(rect.width * dpr);
+      detectionCanvas.height = Math.round(rect.height * dpr);
+      detectionContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawDetections(latestDetections);
+    }
+
+    function drawDetections(data) {
+      const rect = cameraPanel.getBoundingClientRect();
+      detectionContext.clearRect(0, 0, rect.width, rect.height);
+      if (!data || !data.image || !Array.isArray(data.detections) || !video.videoWidth || !video.videoHeight) return;
+
+      const vr = video.getBoundingClientRect();
+      const scale = Math.min(vr.width / data.image.width, vr.height / data.image.height);
+      const renderedWidth = data.image.width * scale;
+      const renderedHeight = data.image.height * scale;
+      const offsetX = vr.left - rect.left + (vr.width - renderedWidth) / 2;
+      const offsetY = vr.top - rect.top + (vr.height - renderedHeight) / 2;
+
+      detectionContext.lineWidth = 2;
+      detectionContext.font = "bold 12px Arial, sans-serif";
+      detectionContext.textBaseline = "middle";
+      for (const item of data.detections) {
+        const b = item.box;
+        const x = offsetX + b.x1 * scale;
+        const y = offsetY + b.y1 * scale;
+        const w = (b.x2 - b.x1) * scale;
+        const h = (b.y2 - b.y1) * scale;
+        const idLabel = item.track_id !== null && item.track_id !== undefined ? `#${item.track_id}` : "ID ?";
+        const label = `${item.class_name} ${idLabel} · ${(item.confidence * 100).toFixed(0)}%`;
+        detectionContext.strokeStyle = "#22c7b8";
+        detectionContext.fillStyle = "#22c7b8";
+        detectionContext.strokeRect(x, y, w, h);
+        const labelWidth = detectionContext.measureText(label).width + 12;
+        const labelY = Math.max(offsetY + 10, y - 10);
+        detectionContext.fillRect(x, labelY - 10, labelWidth, 20);
+        detectionContext.fillStyle = "#071421";
+        detectionContext.fillText(label, x + 6, labelY);
+      }
+    }
+
+    function showDetections(data) {
+      latestDetections = data;
+      resizeDetectionCanvas();
+      detectionResults.hidden = false;
+      detectionMetric.textContent = String(data.count);
+      const trackedIds = data.detections
+        .map(item => item.track_id)
+        .filter(id => id !== null && id !== undefined);
+      trackedIds.forEach(id => sessionTrackIds.add(id));
+      sessionDetectionTotal += data.count;
+      trackedMetric.textContent = String(sessionTrackIds.size);
+      trackedNote.textContent = `${trackedIds.length} tracked in latest frame · ${sessionDetectionTotal} detections processed`;
+      processingMetric.textContent = "ONLINE";
+      processingNote.textContent = "Local YOLO11n inference";
+      status.textContent = `TRACKING · ${trackedIds.length} ID${trackedIds.length === 1 ? "" : "S"}`;
+      message.textContent = "Camera connected to Sightline's local detector and tracker.";
+
+      if (!data.count) {
+        detectionResults.textContent = "No trained objects detected in this frame.";
+        return;
+      }
+      detectionResults.replaceChildren();
+      const heading = document.createElement("strong");
+      heading.textContent = `Objects in latest frame: ${data.count} · IDs assigned: ${trackedIds.length} · Unique IDs this session: ${sessionTrackIds.size}`;
+      detectionResults.appendChild(heading);
+      const list = document.createElement("ul");
+      list.style.margin = "8px 0 0";
+      list.style.paddingLeft = "20px";
+      for (const item of data.detections) {
+        const li = document.createElement("li");
+        const idText = item.track_id !== null && item.track_id !== undefined ? `#${item.track_id}` : "ID not assigned";
+        li.textContent = `${item.class_name} ${idText} — ${(item.confidence * 100).toFixed(1)}% confidence`;
+        list.appendChild(li);
+      }
+      detectionResults.appendChild(list);
+    }
+
+    async function captureFrame() {
+      if (!cameraStream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || predictionBusy) return;
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (!width || !height) return;
+
+      const scale = Math.min(1, 640 / width);
+      frameCanvas.width = Math.max(1, Math.round(width * scale));
+      frameCanvas.height = Math.max(1, Math.round(height * scale));
+      frameContext.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+      predictionBusy = true;
+
+      try {
+        const blob = await new Promise(resolve => frameCanvas.toBlob(resolve, "image/jpeg", 0.75));
+        if (!blob) throw new Error("Could not encode camera frame.");
+        const formData = new FormData();
+        formData.append("file", blob, "sightline-frame.jpg");
+        const response = await fetch(API_URL, { method: "POST", body: formData });
+        if (!response.ok) {
+          let detail = `API request failed (${response.status}).`;
+          try { const errorData = await response.json(); if (errorData.detail) detail = errorData.detail; } catch (_) {}
+          throw new Error(detail);
+        }
+        const data = await response.json();
+        if (cameraStream) showDetections(data);
+      } catch (error) {
+        console.error("Sightline inference error:", error);
+        status.textContent = "DETECTION ERROR";
+        message.textContent = "Could not get a prediction. Confirm the local API is running.";
+        processingMetric.textContent = "ERROR";
+        processingNote.textContent = error.message || "API connection failed";
+        detectionResults.hidden = false;
+        detectionResults.textContent = `Detection error: ${error.message || "Unknown error"}`;
+      } finally {
+        predictionBusy = false;
+      }
+    }
+
+    function startFrameCapture() {
+      stopFrameCapture();
+      captureFrame();
+      frameTimer = setInterval(captureFrame, 1500);
+    }
+    function stopFrameCapture() {
+      if (frameTimer !== null) { clearInterval(frameTimer); frameTimer = null; }
+    }
+
+    async function startCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        message.textContent = "Camera access is unavailable. Open this page on localhost in a supported browser.";
+        status.textContent = "CAMERA UNAVAILABLE";
+        return;
+      }
+      startButton.disabled = true;
+      message.textContent = "Waiting for camera permission…";
+      status.textContent = "REQUESTING ACCESS";
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        video.srcObject = cameraStream;
+        await video.play();
+        placeholder.hidden = true;
+        video.classList.add("camera-active");
+        detectionResults.hidden = false;
+        detectionResults.textContent = "Camera connected. Waiting for the first prediction…";
+        processingMetric.textContent = "CONNECTING";
+        processingNote.textContent = "Contacting local API";
+        status.textContent = "CAMERA ACTIVE";
+        stopButton.disabled = false;
+        resizeDetectionCanvas();
+        startFrameCapture();
+      } catch (error) {
+        console.error("Sightline camera error:", error);
+        let explanation = "Could not access the camera.";
+        if (error.name === "NotAllowedError") explanation = "Camera permission was denied. Allow camera access in browser settings, then try again.";
+        else if (error.name === "NotFoundError") explanation = "No camera was found. Connect a webcam and try again.";
+        else if (error.name === "NotReadableError") explanation = "The camera may be in use by another application. Close that application and retry.";
+        message.textContent = explanation;
+        status.textContent = "CAMERA ERROR";
+        if (cameraStream) { cameraStream.getTracks().forEach(track => track.stop()); cameraStream = null; }
+        video.srcObject = null;
+        placeholder.hidden = false;
+        video.classList.remove("camera-active");
+        startButton.disabled = false;
+        stopButton.disabled = true;
+      }
+    }
+
+    function resetSessionStats() {
+      sessionTrackIds.clear();
+      sessionDetectionTotal = 0;
+      trackedMetric.textContent = "0";
+      trackedNote.textContent = "Seen this session";
+      if (latestDetections && Array.isArray(latestDetections.detections)) {
+        const currentIds = latestDetections.detections
+          .map(item => item.track_id)
+          .filter(id => id !== null && id !== undefined);
+        currentIds.forEach(id => sessionTrackIds.add(id));
+        sessionDetectionTotal = latestDetections.count || 0;
+        trackedMetric.textContent = String(sessionTrackIds.size);
+        trackedNote.textContent = `${currentIds.length} tracked in latest frame · ${sessionDetectionTotal} detections processed`;
+      }
+    }
+
+    function stopCamera() {
+      stopFrameCapture();
+      if (cameraStream) { cameraStream.getTracks().forEach(track => track.stop()); cameraStream = null; }
+      video.pause();
+      video.srcObject = null;
+      video.classList.remove("camera-active");
+      placeholder.hidden = false;
+      message.textContent = "Your camera is off. Start it whenever you're ready.";
+      status.textContent = "CAMERA OFF";
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      latestDetections = null;
+      detectionContext.clearRect(0, 0, detectionCanvas.width, detectionCanvas.height);
+      detectionResults.hidden = true;
+      detectionMetric.textContent = "—";
+      trackedMetric.textContent = String(sessionTrackIds.size);
+      trackedNote.textContent = "Seen this session";
+      processingMetric.textContent = "OFFLINE";
+      processingNote.textContent = "Backend not connected";
+    }
+
+    startButton.addEventListener("click", startCamera);
+    stopButton.addEventListener("click", stopCamera);
+    resetStatsButton.addEventListener("click", resetSessionStats);
+    window.addEventListener("resize", resizeDetectionCanvas);
+    window.addEventListener("pagehide", stopCamera);
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+﻿.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.env
+.ipynb_checkpoints
+.vscode
+dataset/raw/*
+dataset/annotated/*
+runs/
+outputs/
